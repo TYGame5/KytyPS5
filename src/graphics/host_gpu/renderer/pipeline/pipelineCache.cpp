@@ -117,8 +117,8 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
 
-void DumpShader(std::span<const uint32_t> words, const std::string& name) {
-	if (!Config::GraphicsDebugDumpEnabled()) {
+void DumpShader(std::span<const uint32_t> words, const std::string& name, bool force = false) {
+	if (!force && !Config::GraphicsDebugDumpEnabled()) {
 		return;
 	}
 	const auto path = Config::GetShaderLogFolder() / name;
@@ -133,8 +133,9 @@ void DumpShader(std::span<const uint32_t> words, const std::string& name) {
 }
 
 void ValidateShaderSpirv(const char* stage, uint64_t shader_hash,
-                         const std::vector<uint32_t>& spirv, bool maintenance8_enabled) {
-	if (!Config::ShaderValidationEnabled()) {
+                         const std::vector<uint32_t>& spirv, bool maintenance8_enabled,
+                         bool force = false) {
+	if (!force && !Config::ShaderValidationEnabled()) {
 		return;
 	}
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
@@ -319,7 +320,16 @@ ShaderModule& PipelineCache::CompileModule(Program& program, const ProgramKey& k
 
 	const auto* stage = ShaderRecompiler::StageName(key.stage);
 	DumpShader(result.spirv, fmt::format("{}_{:016x}_{:016x}.spv", stage, key.hash, id));
-	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8);
+	// This pair is the PRAGMATA post-video pipeline currently rejected by the ICD with
+	// VK_ERROR_UNKNOWN. Preserve just these binaries and validate them independently of the UI
+	// debugging switches, so the failing input can be inspected without dumping the whole title.
+	const bool pipeline_failure_shader = id == 9497356789046893653ull ||
+	                                     id == 11297463309464146811ull;
+	if (pipeline_failure_shader) {
+		DumpShader(result.spirv, fmt::format("_ShaderFailures/{}_{:016x}.spv", stage, id), true);
+	}
+	ValidateShaderSpirv(stage, key.hash, result.spirv, profile.maintenance8,
+	                    pipeline_failure_shader);
 	auto& module = program.modules.emplace_back(ShaderModule {
 	    .id             = id,
 	    .module         = CompileSPV(result.spirv, m_graphics.device),
@@ -586,17 +596,20 @@ void PipelineCache::Save() {
 	size_t               size = 0;
 	vk::Result           result;
 	std::vector<uint8_t> payload;
-	for (uint32_t attempt = 0; attempt < 3; attempt++) {
-		size   = 0;
-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
-		if (result != vk::Result::eSuccess || size == 0 ||
-		    size > std::numeric_limits<uint32_t>::max()) {
-			break;
-		}
-		payload.resize(size);
-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
-		if (result != vk::Result::eIncomplete) {
-			break;
+	{
+		std::unique_lock lock(m_driver_cache_mutex);
+		for (uint32_t attempt = 0; attempt < 3; attempt++) {
+			size   = 0;
+			result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
+			if (result != vk::Result::eSuccess || size == 0 ||
+			    size > std::numeric_limits<uint32_t>::max()) {
+				break;
+			}
+			payload.resize(size);
+			result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
+			if (result != vk::Result::eIncomplete) {
+				break;
+			}
 		}
 	}
 	if (result != vk::Result::eSuccess || size == 0 ||
@@ -1019,6 +1032,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		EXIT("Pipeline: sample-rate shading is required but unsupported by the host\n");
 	}
 	static_params.alpha_to_coverage_enable = ps_active && ctx.GetShaderRegisters().AlphaToMask();
+	if (ctx.GetColorControl().mode == 1u) {
+		static_params.logic_op = ctx.GetColorControl().op;
+	}
 	const bool rect_list = Prospero::IsRectList(command.GetUserConfig().GetPrimType());
 	static_params.provoking_vtx_last = mc.provoking_vtx_last;
 	static_params.polygon_mode =
@@ -1073,6 +1089,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		std::shared_lock lock(m_driver_cache_mutex);
 		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
 	}
 	StorePipeline(key);
@@ -1101,6 +1118,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::PipelinesCreated,
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
+		std::shared_lock lock(m_driver_cache_mutex);
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
 	}
 	CheckpointDriverCache();

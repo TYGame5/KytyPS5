@@ -90,9 +90,12 @@ void RenderExecutor::ProcessPssr(CommandBuffer& buffer, const Pssr::Request& req
 	EXIT_IF(input.desc.info.data.address < output.desc.info.data.End() &&
 	        output.desc.info.data.address < input.desc.info.data.End());
 	const auto acquire = [&](TextureBinding& binding, const uint32_t* words, bool storage) {
-		auto& previous = cache.GetImage(binding.image_id);
-		if (!previous.registered || previous.binding.needs_rebind) {
-			previous.binding = {};
+		auto* previous = cache.m_slot_images.try_get(binding.image_id);
+		if (previous == nullptr || !previous->registered ||
+		    previous->serial != binding.image_serial || previous->binding.needs_rebind) {
+			if (previous != nullptr && previous->serial == binding.image_serial) {
+				previous->binding = {};
+			}
 			binding = resolve(words, storage);
 			BindImage(binding.image_id, storage);
 		}

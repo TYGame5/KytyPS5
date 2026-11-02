@@ -655,6 +655,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.drawIndirectFirstInstance            = VK_TRUE;
 	device_features.multiDrawIndirect                    = VK_TRUE;
 	device_features.sampleRateShading                    = VK_TRUE;
+	graphics.logic_op_enabled                            = supported_features2.features.logicOp == VK_TRUE;
+	device_features.logicOp                              = graphics.logic_op_enabled;
 	device_features.depthBiasClamp                       = VK_TRUE;
 	device_features.shaderClipDistance                   = VK_TRUE;
 	device_features.shaderCullDistance                   = VK_TRUE;

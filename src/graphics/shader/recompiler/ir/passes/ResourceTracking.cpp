@@ -4239,13 +4239,37 @@ private:
 			               memory.resource * 4u, handle, source)) {
 				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
 				                                                        : ResourceKind::Buffer) ||
-				    !memory.SupportsIndirectBufferLoad(op)) {
+				    (!memory.SupportsIndirectBufferLoad(op) &&
+				     !memory.SupportsIndirectBufferStore(op))) {
+					std::array<uint32_t, 4> descriptor_words {};
+					std::string descriptor_dump;
+					if (handle != nullptr && handle->GetOpcode() == ValueOpcode::GetBufferResource) {
+						for (uint32_t i = 0; i < descriptor_words.size() && i < handle->NumArgs(); ++i) {
+							const auto word = handle->Arg(i).Resolve();
+							descriptor_words[i] =
+							    word.IsImmediate() && word.GetType() == Type::U32 ? word.U32() : UINT32_MAX;
+						}
+						descriptor_dump = fmt::format(
+						    " descriptor=[{:08x},{:08x},{:08x},{:08x}]", descriptor_words[0],
+						    descriptor_words[1], descriptor_words[2], descriptor_words[3]);
+					}
 					Fail(flags.pc,
-					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw 8/16-bit, raw DWORD x1/x2/x3/x4, or formatted X load");
+					     fmt::format("buffer descriptor runtime selection rejected: opcode={} "
+					                 "resource_kind={} data_bits={} data_dwords={} components={} "
+					                 "component_index={} data_format={} number_format={} "
+					                 "typed={} formatted={} coherent={} idxen={} offen={} "
+					                 "descriptor_base_dword={}{}; supported GPU-selected accesses are "
+					                 "scalar, raw 8/16-bit loads, raw DWORD x1/x2/x3/x4 loads/stores, "
+					                 "and formatted X loads",
+					                 ValueOpcodeName(op), static_cast<uint32_t>(memory.kind),
+					                 memory.data_bits, memory.data_dwords, memory.component_count,
+					                 memory.component_index, memory.data_format, memory.number_format,
+					                 memory.typed, memory.formatted, memory.coherent, memory.idxen,
+					                 memory.offen, memory.resource * 4u, descriptor_dump));
 				}
 				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
 				m_info.uses_dma                         = true;
+				m_program.has_address_writes |= buffer == BufferAccess::Write || buffer == BufferAccess::Atomic;
 				return;
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);

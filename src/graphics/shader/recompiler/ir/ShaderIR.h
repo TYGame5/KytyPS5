@@ -97,6 +97,18 @@ struct MemoryInfo {
 		                        opcode == ValueOpcode::LoadBufferU32x4);
 	}
 
+	[[nodiscard]] bool SupportsIndirectBufferStore(ValueOpcode opcode) const {
+		if (typed || formatted || data_bits != 32u || data_dwords != component_count) return false;
+		switch (opcode) {
+			case ValueOpcode::StoreBufferU32: return data_dwords == 1u;
+			case ValueOpcode::StoreBufferU32x2: return data_dwords == 2u;
+			case ValueOpcode::StoreBufferU32x3: return data_dwords == 3u;
+			case ValueOpcode::StoreBufferU32x4: return data_dwords == 4u;
+			default: return false;
+		}
+	}
+
+
 	bool operator==(const MemoryInfo& other) const = default;
 };
 

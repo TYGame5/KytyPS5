@@ -451,18 +451,22 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	for (auto* view: m_active) {
 		bool       stale = false;
 		const auto mark  = [&](uint32_t index) { m_elements[index].stale = stale = true; };
-		if (view->resolve_epoch != epoch) {
-			view->resolve_epoch = epoch;
-			for (const auto& [value, index]: view->elements) {
-				const auto& binding = m_elements[index].binding;
-				if (!binding.image_id) continue;
-				const auto* image = ImageOf(m_elements[index]);
-				if (image == nullptr || !image->registered || image->depth_id ||
-				    image->binding.needs_rebind) {
-					mark(index);
-				} else {
-					(void)textures.FindTexture(binding.image_id, binding.desc);
-				}
+		const bool resolve_changed = view->resolve_epoch != epoch;
+		view->resolve_epoch       = epoch;
+		// A heap entry stores a raw VkImageView. The epoch avoids unnecessary view-cache
+		// lookups, but it is not a lifetime guarantee: an image may be retired by an
+		// overlap/alias path which did not have a live heap reference at the time. Always
+		// validate the slot generation before writing descriptors, so such an entry is
+		// rebuilt instead of passing a destroyed view to vkUpdateDescriptorSets.
+		for (const auto& [value, index]: view->elements) {
+			const auto& binding = m_elements[index].binding;
+			if (!binding.image_id) continue;
+			const auto* image = ImageOf(m_elements[index]);
+			if (image == nullptr || !image->registered || image->depth_id ||
+			    image->binding.needs_rebind) {
+				mark(index);
+			} else if (resolve_changed) {
+				(void)textures.FindTexture(binding.image_id, binding.desc);
 			}
 		}
 		// Discovery applies the color metadata clears written since the last draw.
@@ -534,8 +538,24 @@ void ImageHeap::WriteDescriptors() {
 	std::vector<vk::WriteDescriptorSet>  writes(m_writes.size());
 	infos.reserve(m_writes.size());
 	for (size_t write = 0; write < m_writes.size(); ++write) {
-		const auto& binding = m_elements[m_writes[write]].binding;
-		infos.push_back({nullptr, binding.image_view, binding.layout});
+		const auto& element = m_elements[m_writes[write]];
+		const auto& binding = element.binding;
+		// An element can be queued here and then released before the accumulated writes
+		// are committed. Never submit the released element's raw view: Image destruction
+		// invalidates it before Vulkan sees this descriptor update. A null descriptor is
+		// correct for a released slot; a live slot must still refer to its current image
+		// generation and one of that image's cached views.
+		vk::DescriptorImageInfo info {nullptr, nullptr, vk::ImageLayout::eGeneral};
+		if (element.refs != 0u && binding.image_id) {
+			const auto* image = ImageOf(element);
+			if (image != nullptr && image->registered &&
+			    binding.image_serial == image->serial &&
+			    std::ranges::find(image->views, binding.image_view, &CachedImageView::view) !=
+			        image->views.end()) {
+				info = {nullptr, binding.image_view, binding.layout};
+			}
+		}
+		infos.push_back(info);
 		writes[write].dstSet          = m_set;
 		writes[write].dstArrayElement = m_writes[write];
 		writes[write].descriptorCount = 1;

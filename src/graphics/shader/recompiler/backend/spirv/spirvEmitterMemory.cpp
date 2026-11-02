@@ -167,9 +167,13 @@ uint32_t FaultElementPointer(EmitterState& state, uint32_t index) {
 	return pointer;
 }
 
-void RecordBdaFault(EmitterState& state, uint32_t page) {
-	const auto word =
+void RecordBdaFault(EmitterState& state, uint32_t page, uint32_t word_offset = 0) {
+	auto word =
 	    Binary(state, spv::OpShiftRightLogical, TypeU32(state), page, ConstantU32(state, 5));
+	if (word_offset != 0u) {
+		word = Binary(state, spv::OpIAdd, TypeU32(state), word,
+		              ConstantU32(state, word_offset));
+	}
 	const auto bit =
 	    Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1),
 	           Binary(state, spv::OpBitwiseAnd, TypeU32(state), page, ConstantU32(state, 31)));
@@ -178,6 +182,24 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 	state.builder.AddFunction(spv::OpStore, pointer,
 	                          Binary(state, spv::OpBitwiseOr, TypeU32(state), value, bit));
+}
+
+// The second bitmap in the fault buffer tracks pages changed through a
+// GPU-selected descriptor. The CPU consumes it and marks those pages GPU-dirty.
+void RecordBdaWrite(EmitterState& state, uint32_t address) {
+	const auto extended = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), address,
+	                             ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase));
+	const auto packed   = Select(
+	    state, TypeU64(state), extended,
+	    Binary(state, spv::OpISub, TypeU64(state), address,
+	           ConstantU64(state, LibKernel::Memory::kExtendedMemoryBase - LOWER_ADDRESS_SIZE)),
+	    address);
+	const auto page64 = Binary(state, spv::OpShiftRightLogical, TypeU64(state), packed,
+	                           ConstantU32(state, BufferCache::CACHING_PAGEBITS));
+	const auto page = Unary(state, spv::OpUConvert, TypeU32(state), page64);
+	constexpr auto write_bitmap_word_offset =
+	    static_cast<uint32_t>(BufferCache::CACHING_NUMPAGES / 32u);
+	RecordBdaFault(state, page, write_bitmap_word_offset);
 }
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
@@ -210,6 +232,39 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 		                              (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
 		                          alignment);
 		return value;
+	});
+}
+
+void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t data, bool coherent) {
+	auto&      state   = ctx.state;
+	const auto bda     = GetBdaPointer(state, address);
+	const auto present =
+	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
+	EmitIfCondition(state, present, [&]() {
+		auto pointer = state.builder.AllocateId();
+		if (coherent) {
+			const auto block = state.builder.DecoratedType(
+			    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+			                        {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
+			                        {spv::OpDecorate, {spv::DecorationBlock}}}, TypeU32(state));
+			state.builder.AddFunction(
+			    spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block),
+			    pointer, bda);
+			const auto base = pointer;
+			pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state), pointer,
+			                          base, ConstantU32(state, 0));
+		} else {
+			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+			                          bda);
+		}
+		constexpr uint32_t alignment = sizeof(uint32_t);
+		state.builder.AddFunction(spv::OpStore, pointer, data,
+		                          spv::MemoryAccessAlignedMask |
+		                              (coherent ? spv::MemoryAccessVolatileMask
+		                                        : spv::MemoryAccessMaskNone),
+		                          alignment);
+		RecordBdaWrite(state, address);
 	});
 }
 
@@ -1029,6 +1084,37 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 	return ConstructU32Composite(state, components, values);
 }
 
+void StoreIndirectBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto& state = ctx.state;
+	const auto buffer = PrepareIndirectBuffer(state, IndirectBufferArgs(ctx, inst), false);
+	const auto valid_format = Binary(state, spv::OpINotEqual, TypeBool(state), buffer.format,
+	                                  ConstantU32(state, 0));
+	const auto base = Binary(state, spv::OpBitwiseAnd, TypeU64(state), buffer.address,
+	                         ConstantU64(state, ~uint64_t {3}));
+	const auto components = IR::BufferComponentCount(inst.GetOpcode());
+	const auto composite = ctx.Arg(inst, inst.NumArgs() - 2);
+	for (uint32_t component = 0; component < components; ++component) {
+		const auto in_bounds = AndCondition(
+		    state, valid_format,
+		    IndirectBufferInBounds(state, buffer, component * sizeof(uint32_t),
+		                           ConstantU32(state, sizeof(uint32_t)), false));
+		auto data = composite;
+		if (components != 1u) {
+			data = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite,
+			                          component);
+		}
+		EmitIfCondition(state,
+		                AndCondition(state, ctx.Arg(inst, inst.NumArgs() - 1), in_bounds), [&]() {
+				const auto address = component == 0u
+				                         ? base
+				                         : Binary(state, spv::OpIAdd, TypeU64(state), base,
+				                                  ConstantU64(state, component * sizeof(uint32_t)));
+				StoreBdaDword(ctx, address, data, ctx.Memory(inst).coherent);
+			});
+	}
+}
+
 uint32_t LoadIndirectFormattedX(ValueEmitContext& ctx, const IndirectBufferAccess& buffer) {
 	auto& state = ctx.state;
 	const auto geometry = state.builder.AllocateId();
@@ -1671,6 +1757,8 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
 	if (mem.kind == IR::ResourceKind::FlatLocal)
 		StoreLocalFlat(ctx, inst);
+	else if (mem.kind == IR::ResourceKind::IndirectBuffer)
+		StoreIndirectBuffer(ctx, inst);
 	else if (buffer_components > 1u)
 		StoreBuffer(ctx, inst, buffer_components);
 	else if (shared_components > 1u)

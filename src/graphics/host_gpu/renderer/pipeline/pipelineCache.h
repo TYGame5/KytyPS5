@@ -21,6 +21,7 @@
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <shared_mutex>
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -59,6 +60,8 @@ struct PipelineStaticParameters {
 	uint32_t                   samples                  = 1;
 	bool                       sample_shading_enable    = false;
 	bool                       alpha_to_coverage_enable = false;
+	// Kept as a dword so GraphicsPipelineKey stays padding-free for its raw-byte hash.
+	uint32_t                   logic_op                 = 0xcc;
 	uint32_t                   color_mask[RENDER_COLOR_ATTACHMENTS_MAX]           = {};
 	bool                       provoking_vtx_last                                 = false;
 	vk::PolygonMode            polygon_mode                                       = vk::PolygonMode::eFill;
@@ -245,6 +248,9 @@ private:
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
 	ProgramKey                             m_lookup_key;
 	vk::PipelineCache             m_driver_cache = nullptr;
+	// Pipeline creation may use the cache concurrently, but taking a snapshot must
+	// exclude every creator. This follows the shared/exclusive model used by AnyPS5.
+	mutable std::shared_mutex      m_driver_cache_mutex;
 	std::filesystem::path         m_driver_cache_path;
 	std::chrono::steady_clock::time_point m_next_driver_cache_save;
 	bool                          m_driver_cache_dirty = false;

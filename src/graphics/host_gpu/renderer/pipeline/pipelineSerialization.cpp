@@ -182,6 +182,7 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	for (const auto* module: modules | std::views::values) {
 		if (module != nullptr && module->info.stage == ShaderType::Compute) {
 			jobs.emplace_back([this, module, &pipeline = m_compute_pipelines[module->id]] {
+				std::shared_lock lock(m_driver_cache_mutex);
 				CreatePipelineInternal(m_graphics, pipeline, *module, m_driver_cache);
 			});
 		}
@@ -330,6 +331,7 @@ bool PipelineCache::CreateGraphicsPipeline(Pipeline& pipeline, const GraphicsPip
 		}
 		stages[i] = found->second;
 	}
+	std::shared_lock lock(m_driver_cache_mutex);
 	CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
 	return true;
 }

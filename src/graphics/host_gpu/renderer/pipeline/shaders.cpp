@@ -66,6 +66,53 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 	return vk::BlendOp::eAdd;
 }
 
+// CB_COLOR_CONTROL ROP3 values supported by the PS5 command stream are either source- or
+// brush-only truth tables. Their sixteen truth-table combinations map directly to Vulkan logic
+// operations; mixed source/brush ROP3 values intentionally remain unsupported.
+static vk::LogicOp GetLogicOp(uint32_t rop) {
+	EXIT_NOT_IMPLEMENTED(rop > 0xffu);
+	const bool documented = (rop >> 4u) == (rop & 0x0fu) ||
+	                        ((rop >> 2u) & 0x33u) == (rop & 0x33u);
+	EXIT_NOT_IMPLEMENTED(!documented);
+	static constexpr std::array operations {
+	    vk::LogicOp::eClear,       vk::LogicOp::eNor,          vk::LogicOp::eAndInverted,
+	    vk::LogicOp::eCopyInverted, vk::LogicOp::eAndReverse,   vk::LogicOp::eInvert,
+	    vk::LogicOp::eXor,         vk::LogicOp::eNand,         vk::LogicOp::eAnd,
+	    vk::LogicOp::eEquivalent,  vk::LogicOp::eNoOp,         vk::LogicOp::eOrInverted,
+	    vk::LogicOp::eCopy,        vk::LogicOp::eOrReverse,    vk::LogicOp::eOr,
+	    vk::LogicOp::eSet,
+	};
+	const uint32_t index = (rop & 3u) | ((rop >> 4u) & 4u) | ((rop >> 4u) & 8u);
+	return operations[index];
+}
+
+// Vulkan logic operations are defined only for the normalized and unsigned integer color
+// attachment formats used by the guest's supported ROP3 path. Do not hand an unsupported
+// float/signed format to the driver: several ICDs report only VK_ERROR_UNKNOWN for that case.
+static bool IsLogicOpFormat(vk::Format format) {
+	switch (format) {
+		case vk::Format::eR8Unorm:
+		case vk::Format::eR8G8Unorm:
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eR16Unorm:
+		case vk::Format::eR16G16Unorm:
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eR8Uint:
+		case vk::Format::eR8G8Uint:
+		case vk::Format::eR8G8B8A8Uint:
+		case vk::Format::eR16Uint:
+		case vk::Format::eR16G16Uint:
+		case vk::Format::eR16G16B16A16Uint:
+		case vk::Format::eR32Uint:
+		case vk::Format::eR32G32Uint:
+		case vk::Format::eR32G32B32A32Uint: return true;
+		default: return false;
+	}
+}
+
 static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
                               const ShaderRecompiler::IR::CompiledShaderInfo& program,
                               vk::ShaderStageFlagBits              stage) {
@@ -296,7 +343,21 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 #if !defined(__APPLE__)
 	color_blending.pNext = &color_write;
 #endif
-	color_blending.logicOp         = vk::LogicOp::eCopy;
+	const auto logic_op = GetLogicOp(static_params.logic_op);
+	const bool logic_op_format_supported = std::ranges::all_of(
+	    std::span(rendering.color_formats).first(rendering.color_count), IsLogicOpFormat);
+	const bool logic_op_blending = std::ranges::any_of(static_params.blend_enable,
+	                                                    [](bool enabled) { return enabled; });
+	if (logic_op != vk::LogicOp::eCopy && graphics.logic_op_enabled &&
+	    logic_op_format_supported && !logic_op_blending) {
+		color_blending.logicOpEnable = VK_TRUE;
+	} else if (logic_op != vk::LogicOp::eCopy) {
+		LOGF("Pipeline: ROP3 0x%02x falls back to Copy (logic_op=%s format=%s blending=%s)\n",
+		     static_params.logic_op, graphics.logic_op_enabled ? "enabled" : "unavailable",
+		     logic_op_format_supported ? "supported" : "unsupported",
+		     logic_op_blending ? "enabled" : "disabled");
+	}
+	color_blending.logicOp         = color_blending.logicOpEnable ? logic_op : vk::LogicOp::eCopy;
 	color_blending.attachmentCount = rendering.color_count;
 	color_blending.pAttachments    = color_blend_attachment;
 
@@ -337,7 +398,12 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		LOGF("PipelineTrace: vkCreatePipelineLayout done result=%s layout=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("vkCreatePipelineLayout failed: result=%s sets=%u uses_image_heap=%u VS=%" PRIu64
+		     " PS=%" PRIu64 "\n",
+		     vk::to_string(result).c_str(), pipeline_layout_info.setLayoutCount,
+		     pipeline.uses_image_heap ? 1u : 0u, key.stage_ids[0], key.stage_ids[3]);
+	}
 
 	vk::PipelineDepthStencilStateCreateInfo depth_stencil_info {};
 
@@ -409,13 +475,43 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		     (with_depth ? "true" : "false"), (static_params.blend_enable[0] ? "true" : "false"),
 		     dynamic_state.dynamicStateCount);
 	}
-	result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
-	                                                 &pipeline.pipeline);
+	auto create_pipeline = [&](vk::PipelineCache cache) {
+		pipeline.pipeline = nullptr;
+		return graphics.device.createGraphicsPipelines(cache, 1, &pipeline_info, nullptr,
+		                                               &pipeline.pipeline);
+	};
+	result = create_pipeline(driver_cache);
+	// Some drivers expose a stale or compiler-sensitive cache entry only as ErrorUnknown. Retry the
+	// exact pipeline without the cache before treating it as an emulation or shader failure.
+	if (result == vk::Result::eErrorUnknown && driver_cache != nullptr) {
+		LOGF("Pipeline: retrying graphics creation without the driver cache (VS=%" PRIu64
+		     " PS=%" PRIu64 ")\n",
+		     key.stage_ids[0], key.stage_ids[3]);
+		result = create_pipeline(nullptr);
+	}
+	// If the ICD still rejects it, request the portable, unoptimized compiler path. This is limited
+	// to the failing pipeline and avoids changing already-working pipelines or global driver state.
+	if (result == vk::Result::eErrorUnknown) {
+		LOGF("Pipeline: retrying graphics creation with optimization disabled (VS=%" PRIu64
+		     " PS=%" PRIu64 ")\n",
+		     key.stage_ids[0], key.stage_ids[3]);
+		pipeline_info.flags |= vk::PipelineCreateFlagBits::eDisableOptimization;
+		result = create_pipeline(nullptr);
+	}
 	if (graphics_debug_dump_enabled()) {
 		LOGF("PipelineTrace: vkCreateGraphicsPipelines done result=%s pipeline=%p\n",
 		     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	}
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("vkCreateGraphicsPipelines failed: result=%s VS=%" PRIu64 " PS=%" PRIu64
+		     " stages=%u topology=%u samples=%u colors=%u depth_format=%d stencil_format=%d"
+		     " color0_format=%d rop=0x%02x uses_image_heap=%u\n",
+		     vk::to_string(result).c_str(), key.stage_ids[0], key.stage_ids[3], shader_stage_count,
+		     static_cast<uint32_t>(static_params.topology), static_params.samples, rendering.color_count,
+		     static_cast<int>(rendering.depth_format), static_cast<int>(rendering.stencil_format),
+		     static_cast<int>(rendering.color_formats[0]), static_params.logic_op,
+		     pipeline.uses_image_heap ? 1u : 0u);
+	}
 
 	graphics.device.destroyShaderModule(tess_control_shader_module, nullptr);
 	graphics.device.destroyShaderModule(tess_eval_shader_module, nullptr);
@@ -455,7 +551,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
 	                                                  &pipeline.pipeline_layout);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("vkCreatePipelineLayout (compute) failed: result=%s sets=%u uses_image_heap=%u\n",
+		     vk::to_string(result).c_str(), pipeline_layout_info.setLayoutCount,
+		     pipeline.uses_image_heap ? 1u : 0u);
+	}
 
 	vk::ComputePipelineCreateInfo info {};
 	if (module.info.info.uses_gds) {
@@ -469,7 +569,11 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
 	                                                &pipeline.pipeline);
-	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
+	if (result != vk::Result::eSuccess) {
+		EXIT("vkCreateComputePipelines failed: result=%s uses_image_heap=%u module=%p\n",
+		     vk::to_string(result).c_str(), pipeline.uses_image_heap ? 1u : 0u,
+		     static_cast<void*>(module.module));
+	}
 }
 
 } // namespace Libs::Graphics

@@ -629,7 +629,7 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 		(void)SelectSampledColorView(image->info.pixel_format, pixel_format,
 		                             descriptor.DstSelXYZW());
 	}
-	return {id, nullptr, std::move(desc)};
+	return {.image_id = id, .image_serial = image->serial, .desc = std::move(desc)};
 }
 
 static vk::Sampler NativeSampler(RenderContext&                       context,
@@ -830,14 +830,18 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 	// Acquire each view before a later overlapping descriptor can replace its image.
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		if (!images[i].image_id) continue;
-		auto& old_image = texture_cache.m_slot_images[images[i].image_id];
-		if (!old_image.registered || old_image.binding.needs_rebind) {
-			old_image.binding = {};
+		auto& binding = images[i];
+		auto* old_image = texture_cache.m_slot_images.try_get(binding.image_id);
+		if (old_image == nullptr || !old_image->registered ||
+		    old_image->serial != binding.image_serial || old_image->binding.needs_rebind) {
+			// Do not clear state on a different image that reused this slot.
+			if (old_image != nullptr && old_image->serial == binding.image_serial) {
+				old_image->binding = {};
+			}
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
 		}
-		auto& binding = images[i];
 		binding.mip_views.clear();
 		const auto& resource = program.info.images[i];
 		if (resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
