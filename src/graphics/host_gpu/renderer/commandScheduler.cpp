@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 
 #include "common/assert.h"
+#include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "graphics/host_gpu/graphicContext.h"
 
@@ -126,6 +127,7 @@ void CommandScheduler::Shutdown() {
 		Submit();
 	}
 	m_master.Wait(CurrentTick() - 1);
+	PopPendingDestructions();
 	PopPendingOperations();
 	DrainPriorityOperations();
 	m_priority_thread.request_stop();
@@ -135,7 +137,8 @@ void CommandScheduler::Shutdown() {
 	}
 	{
 		std::lock_guard lock(m_operation_mutex);
-		EXIT_IF(!m_pending_operations.empty() || !m_priority_operations.empty() ||
+		EXIT_IF(!m_pending_operations.empty() || !m_pending_destructions.empty() ||
+		        !m_priority_operations.empty() ||
 		        m_priority_active);
 		m_operation_state = OperationState::Closed;
 	}
@@ -227,6 +230,22 @@ void CommandScheduler::PopPendingOperations() {
 
 void CommandScheduler::DeferOperation(Common::UniqueFunction<void>&& operation) {
 	QueueOperation(std::move(operation), false);
+}
+
+void CommandScheduler::DeferDestruction(Common::UniqueFunction<void>&& operation) {
+	CheckActive();
+	EXIT_IF(!operation);
+	std::unique_lock lock(m_operation_mutex);
+	if (m_operation_state == OperationState::Open) {
+		m_pending_destructions.push({std::move(operation), CurrentTick()});
+		return;
+	}
+	if (g_deferred_callback_scheduler != this) {
+		m_operation_available.wait(lock,
+		                           [this] { return m_operation_state == OperationState::Closed; });
+	}
+	lock.unlock();
+	operation();
 }
 
 void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&& operation) {
@@ -326,7 +345,7 @@ void CommandScheduler::CheckActive() const {
 }
 
 CommandBuffer& CommandScheduler::Current() {
-	CheckActive();
+	EXIT_IF(m_command.IsInvalid());
 	return m_command;
 }
 
@@ -373,6 +392,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 		result = graphics.queue.submit(1, &submit_info, nullptr);
 	}
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result != vk::Result::eSuccess) {
 		ReportVulkanFatal("vkQueueSubmit", result, tick, m_command.m_debug_op,
@@ -388,7 +408,29 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 
 void CommandScheduler::BeginNext() {
 	CheckActive();
+	// Submit() has released the current command buffer at this point. Image/view
+	// destruction must happen here, never while a command buffer is recording.
+	PopPendingDestructions();
 	BeginCommand();
+}
+
+void CommandScheduler::PopPendingDestructions() {
+	EXIT_IF(!m_command.IsInvalid());
+	m_master.Refresh();
+	for (;;) {
+		PendingOperation operation;
+		{
+			std::lock_guard lock(m_operation_mutex);
+			if (m_pending_destructions.empty() ||
+			    !m_master.IsFree(m_pending_destructions.front().tick)) {
+				return;
+			}
+			operation = std::move(m_pending_destructions.front());
+			m_pending_destructions.pop();
+		}
+		WaitPriorityOperations(operation.tick);
+		RunOperation(std::move(operation.callback));
+	}
 }
 
 } // namespace Libs::Graphics

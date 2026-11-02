@@ -20,6 +20,9 @@ struct ShaderStageRuntime;
 
 struct TextureBinding {
 	ImageId                    image_id;
+	// ImageId is a reusable cache slot. Keep the image generation alongside it so
+	// a prepared descriptor cannot reuse a view belonging to a retired slot.
+	uint64_t                   image_serial = 0;
 	vk::ImageView              image_view = nullptr;
 	TextureCache::ImageDesc    desc;
 	vk::ImageLayout            layout = vk::ImageLayout::eUndefined;
