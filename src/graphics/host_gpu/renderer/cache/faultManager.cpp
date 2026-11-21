@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 
+#include <algorithm>
 #include <bit>
 #include <cinttypes>
 #include <cstring>
@@ -17,8 +18,12 @@ namespace Libs::Graphics {
 
 namespace {
 
-constexpr size_t MaxPageFaults    = 1024;
+constexpr size_t MaxPageFaults     = 1024;
+constexpr size_t FaultBitmapBytes  = BufferCache::CACHING_NUMPAGES / 8;
+constexpr size_t WriteBitmapOffset = FaultBitmapBytes;
+constexpr size_t FaultBufferBytes  = FaultBitmapBytes * 2;
 constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(uint64_t);
+constexpr size_t DownloadAreaSize  = PageFaultAreaSize * 2;
 
 } // namespace
 
@@ -26,9 +31,9 @@ FaultManager::FaultManager(GraphicContext& graphics, CommandScheduler& scheduler
                            BufferCache& buffer_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_buffer_cache(buffer_cache),
       m_fault_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags,
-                     BufferCache::CACHING_NUMPAGES / 8),
+	                 FaultBufferBytes),
       m_download_buffer(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
-                        MaxPendingFaults * PageFaultAreaSize) {
+                        MaxPendingFaults * DownloadAreaSize) {
 	SetVulkanObjectNameF(m_graphics.device, m_fault_buffer.Handle(), "Fault Buffer");
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
@@ -80,10 +85,10 @@ void FaultManager::ProcessFaultBuffer() {
 		m_scheduler.PopPendingOperations();
 	}
 
-	const auto offset = m_current_area * PageFaultAreaSize;
+	const auto offset = m_current_area * DownloadAreaSize;
 	auto*      mapped = m_download_buffer.Mapped().data() + offset;
-	std::memset(mapped, 0, PageFaultAreaSize);
-	m_download_buffer.Flush(offset, PageFaultAreaSize);
+	std::memset(mapped, 0, DownloadAreaSize);
+	m_download_buffer.Flush(offset, DownloadAreaSize);
 
 	vk::BufferMemoryBarrier2 pre_barrier {};
 	pre_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
@@ -97,12 +102,13 @@ void FaultManager::ProcessFaultBuffer() {
 	post_barrier.srcStageMask  = vk::PipelineStageFlagBits2::eComputeShader;
 	post_barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
 	post_barrier.dstStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
-	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	post_barrier.dstAccessMask = vk::AccessFlagBits2::eShaderRead |
+	                             vk::AccessFlagBits2::eShaderWrite;
 
-	const vk::DescriptorBufferInfo infos[] {
-	    {m_fault_buffer.Handle(), 0, m_fault_buffer.Size()},
+	std::array<vk::DescriptorBufferInfo, 2> infos {{
+	    {m_fault_buffer.Handle(), 0, FaultBitmapBytes},
 	    {m_download_buffer.Handle(), offset, PageFaultAreaSize},
-	};
+	}};
 	std::array<vk::WriteDescriptorSet, 2> writes {};
 	for (uint32_t index = 0; index < writes.size(); ++index) {
 		writes[index].dstBinding      = index;
@@ -119,29 +125,46 @@ void FaultManager::ProcessFaultBuffer() {
 	dependency.pBufferMemoryBarriers    = &pre_barrier;
 	command.pipelineBarrier2(dependency);
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_fault_process_pipeline);
-	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
-	                             m_fault_process_pipeline_layout, 0, writes);
 	const auto num_threads    = BufferCache::CACHING_NUMPAGES / 32;
 	const auto num_workgroups = (num_threads + 63) / 64;
-	command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
+	const auto process_bitmap = [&](size_t fault_offset, size_t download_offset) {
+		infos[0].offset = fault_offset;
+		infos[1].offset = download_offset;
+		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
+		                             m_fault_process_pipeline_layout, 0, writes);
+		command.dispatch(static_cast<uint32_t>(num_workgroups), 1, 1);
+	};
+	process_bitmap(0, offset);
+	process_bitmap(WriteBitmapOffset, offset + PageFaultAreaSize);
 	dependency.pBufferMemoryBarriers = &post_barrier;
 	command.pipelineBarrier2(dependency);
 
 	const auto area = m_current_area;
 	m_scheduler.DeferOperation([this, mapped, offset, area] {
-		m_download_buffer.Invalidate(offset, PageFaultAreaSize);
-		RangeSet    fault_ranges;
-		const auto* faults = std::bit_cast<const uint64_t*>(mapped);
-		const auto  count  = static_cast<uint32_t>(faults[0]);
-		for (uint32_t index = 1; index <= count; ++index) {
-			const auto address = BufferCache::GuestAddress(faults[index]);
-			fault_ranges.Add(address, BufferCache::CACHING_PAGESIZE);
-			LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
-		}
-		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
-			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			(void)m_buffer_cache.FindBuffer(start, end - start);
-		});
+		m_download_buffer.Invalidate(offset, DownloadAreaSize);
+		auto process_ranges = [this](const uint8_t* source, bool written) {
+			RangeSet    ranges;
+			const auto* records = std::bit_cast<const uint64_t*>(source);
+			const auto count = std::min(static_cast<uint32_t>(records[0]),
+			                            static_cast<uint32_t>(MaxPageFaults - 1));
+			for (uint32_t index = 1; index <= count; ++index) {
+				const auto address = BufferCache::GuestAddress(records[index]);
+				ranges.Add(address, BufferCache::CACHING_PAGESIZE);
+				if (!written) {
+					LOGF("Accessed non-GPU cached memory at 0x%016" PRIx64 "\n", address);
+				}
+			}
+			ranges.ForEach([this, written](uint64_t start, uint64_t end) {
+				EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
+				if (written) {
+					m_buffer_cache.MarkGpuWritten(start, end - start);
+				} else {
+					(void)m_buffer_cache.FindBuffer(start, end - start);
+				}
+			});
+		};
+		process_ranges(mapped, false);
+		process_ranges(mapped + PageFaultAreaSize, true);
 		m_fault_areas[area] = 0;
 	});
 
